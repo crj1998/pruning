@@ -1,12 +1,9 @@
-import pdb
-
 
 import math
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# from torch.autograd import Variable
 
 from typing import Optional, Tuple
 
@@ -33,7 +30,7 @@ class L0Module(nn.Module):
         self.pruning_type = pruning_type
 
         self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size 
+        self.intermediate_size = config.intermediate_size
         self.num_attention_heads = config.num_attention_heads
         self.mlp_num_per_layer = 1
         self.dim_per_head = self.hidden_size // self.num_attention_heads 
@@ -41,7 +38,6 @@ class L0Module(nn.Module):
 
         self.params_per_head_layer = self.hidden_size * self.hidden_size * 4 + self.hidden_size * 4
         self.params_per_head =  self.params_per_head_layer // self.num_attention_heads
-        
 
         self.params_per_mlp_layer = self.hidden_size * self.intermediate_size * 2 + self.hidden_size + self.hidden_size * 4
         self.params_per_intermediate_dim = self.params_per_mlp_layer // self.intermediate_size
@@ -264,9 +260,14 @@ class L0Module(nn.Module):
         expected_sparsity = 1 - expected_size / self.prunable_model_size
         if self.lagrangian_warmup > 0:
             target_sparsity = self.get_target_sparsity(pruned_steps)
+        zero = torch.tensor(0.0, device=expected_sparsity.device)
+        # lagrangian_loss = (
+        #     self.lambda_1 * (torch.maximum(expected_sparsity - target_sparsity, zero)).abs() + 
+        #     self.lambda_2 * (expected_sparsity - target_sparsity).square()
+        # )
         lagrangian_loss = (
-            self.lambda_1 * (expected_sparsity - target_sparsity).abs() + 
-            self.lambda_2 * (expected_sparsity - target_sparsity).square()
+            self.lambda_1 * torch.maximum(target_sparsity - expected_sparsity, zero) + 
+            self.lambda_2 * torch.maximum(target_sparsity - expected_sparsity, zero).square()
         )
         return lagrangian_loss, expected_sparsity, target_sparsity
 
@@ -277,7 +278,8 @@ class L0Module(nn.Module):
 
     # during training
     def _sample_z(self, loga):
-        eps = self.get_eps(torch.FloatTensor(*loga.shape)).to(loga.device)
+        # eps = self.get_eps(loga.shape).to(loga.device)
+        eps = torch.FloatTensor(loga.shape, device=loga.device).uniform_(epsilon, 1-epsilon)
         z = self.quantile_concrete(eps, loga)
         z = F.hardtanh(z, min_val=0, max_val=1)
         return z
@@ -287,10 +289,7 @@ class L0Module(nn.Module):
         # Following https://github.com/asappresearch/flop/blob/e80e47155de83abbe7d90190e00d30bfb85c18d5/flop/hardconcrete.py#L8 line 103
         expected_num_nonzeros = torch.sum(1 - self.cdf_qz(0, loga))
         expected_num_zeros = size - expected_num_nonzeros.item()
-        try:
-            num_zeros = round(expected_num_zeros)
-        except:
-            pdb.set_trace()
+        num_zeros = round(expected_num_zeros)
         soft_mask = torch.sigmoid(loga / self.temperature * self.magical_number)
         if num_zeros > 0:
             if soft_mask.ndim == 0:
@@ -350,26 +349,26 @@ class L0Module(nn.Module):
         return results
 
 
-    def forward(self, training=True,):
+    def forward(self, training=True):
         zs = {f"{t}_z": [] for t in self.types}
 
         if training:
-            for i, t in enumerate(self.types):
+            for t in self.types:
                 loga = self.z_logas[t]
                 z = self._sample_z(loga)
                 zs[f"{t}_z"] = z.reshape(self.shapes[t])
         else:
-            for i, t in enumerate(self.types):
+            for t in self.types:
                 if t != "hidden": # hidden is not a per layer sample
                     loga_all_layers = self.z_logas[t]
                     for layer in range(len(loga_all_layers)):
                         loga = loga_all_layers[layer]
                         size = self.sizes[t]
                         z = self._deterministic_z(size, loga)
-                        zs[f"{t}_z"].append(z.reshape(self.shapes[t][1:]))
+                        zs[f"{t}_z"].append(z.reshape(self.shapes[t][1:]).detach())
                 else:
                     z = self._deterministic_z(self.sizes[t], self.hidden_loga)
-                    zs[f"{t}_z"] = z
+                    zs[f"{t}_z"] = z.detach()
             for t in zs:
                 if t != "hidden_z":
                     zs[t] = torch.stack(zs[t])
@@ -383,16 +382,12 @@ if __name__ == "__main__":
     # print(l0_module)
     # torch.save(l0_module.state_dict(), "l0_state_dict.pth")
     l0_module = L0Module(config, lagrangian_warmup=200, target_sparsity=0.5)
-    l0_module.load_state_dict(torch.load("l0_state_dict.pth"))
+    # l0_module.load_state_dict(torch.load("l0_state_dict.pth"))
     zs = l0_module.forward(False)
     for n, p in zs.items():
         print(n, tuple(p.shape))
     res = l0_module.calculate_model_size(zs)
     print(res)
+    zs = l0_module.forward(True)
     # for k, v in zs.items():
     #     print(k, v.shape)
-
-
-"""
-CUDA_VISIBLE_DEVICES=0 python main.py
-"""

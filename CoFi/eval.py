@@ -54,7 +54,7 @@ def main(args):
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     # from transformers import ViTModel, ViTForImageClassification
-    from vit import CoFiViTForImageClassification
+    from vit0 import CoFiViTForImageClassification
     from l0module import L0Module
     model = CoFiViTForImageClassification.from_pretrained('google/vit-base-patch16-224')
     model.eval().to(device)

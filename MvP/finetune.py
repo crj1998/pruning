@@ -42,7 +42,7 @@ preprocessed_val_ds = val_ds.map(preprocess_images, batched=True, features=featu
 preprocessed_test_ds = test_ds.map(preprocess_images, batched=True, features=features)
 
 
-from vit import MoveViTForImageClassification
+from vit0 import MoveViTForImageClassification
 from transformers import ViTConfig
 config = ViTConfig.from_pretrained('google/vit-base-patch16-224')
 

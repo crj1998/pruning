@@ -8,7 +8,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from packaging import version
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.data.dataset import Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -21,6 +20,7 @@ from torch.optim import AdamW
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.trainer import Trainer
 from transformers.trainer_utils import (EvalPrediction, PredictionOutput, TrainOutput)
+from transformers.trainer_pt_utils import nested_concat, nested_numpify
 from transformers.training_args import TrainingArguments
 
 from args import CoFiArguments
@@ -48,29 +48,38 @@ class CoFiTrainer(Trainer):
         self.cofi_args = cofi_args
 
         self.l0_module = l0_module
-        self.prepruning_finetune_steps = 16
+        self.prepruning_finetune_steps = 32
         self.start_prune = False
-
+        self.zs = None
         self.l0_optimizer = None
         self.lagrangian_optimizer = None
 
-        self.start_saving_best = True if self.cofi_args.pruning_type is None else False
+        self.start_saving_best = True if self.cofi_args and self.cofi_args.pruning_type is None else False
 
         self.teacher_model = teacher_model
+        self.teacher_layer_trans = None
+        self.student_layer_trans = None
         if self.teacher_model is not None:
+            self.teacher_layer_trans = nn.Linear(model.config.hidden_size, 10).to(self.args.device)
+            self.student_layer_trans = nn.Linear(model.config.hidden_size, 10).to(self.args.device)
             self.teacher_model = self.teacher_model.to(self.args.device)
             self.teacher_model.eval()
         
-        if teacher_model is not None and not cofi_args.do_layer_distill:
-            print(f"Your use teahcer model but not set do_layer_distill.")
+        if self.cofi_args:
+            assert self.cofi_args.layer_distill_version == 0 or (self.cofi_args.layer_distill_version > 0 and self.teacher_model is not None)
+
 
     def create_optimizer_and_scheduler(self, num_training_steps: int, build_l0_optimizer:bool=True):
         if self.optimizer is None:
             no_decay = ["bias", "LayerNorm.weight", "CoFiLayerNorm.weight"]
             freeze_keywords = ["embeddings"]
-
+            trans_params = []
+            if self.student_layer_trans is not None:
+                trans_params.extend(list(self.student_layer_trans.parameters()))
+            if self.teacher_layer_trans is not None:
+                trans_params.extend(list(self.teacher_layer_trans.parameters()))
             main_model_params = [{
-                    "params": [p for n, p in self.model.named_parameters() if not any(nd in n for nd in no_decay) and not any(fk in n for fk in freeze_keywords)],
+                    "params": [p for n, p in self.model.named_parameters() if not any(nd in n for nd in no_decay) and not any(fk in n for fk in freeze_keywords)] + trans_params,
                     "weight_decay": self.args.weight_decay,
                     "lr": self.args.learning_rate
                 }, {
@@ -120,32 +129,34 @@ class CoFiTrainer(Trainer):
                 self.lr_scheduler = None
 
     def calculate_layer_distillation_loss(self, teacher_outputs, student_outputs, zs):
-        if not self.cofi_args.do_layer_distill or not self.start_prune:
+        if self.cofi_args.do_layer_distill <= 1 or not self.start_prune:
             return None
         mse_loss = nn.MSELoss(reduction="mean")
+        kl_loss = nn.KLDivLoss(reduction="batchmean")
         head_layer_z = mlp_z = None
         if "mlp_z" in zs:
             mlp_z = zs["mlp_z"].detach().cpu()
         if "head_layer_z" in zs:
             head_layer_z = zs["head_layer_z"].detach().cpu()
+    
 
-        teacher_layer_output = teacher_outputs.hidden_states[1:] #! hidden states, with a length of 12. Every has a shape of [32, 65, 768]
+        teacher_layer_output = teacher_outputs.hidden_states[1:]
         student_layer_output = student_outputs.hidden_states[1:]
  
-        layer_loss = 0.0
+        layer_loss = torch.tensor(0.0).to(self.args.device)
         # distilliting existing layers
         if self.cofi_args.layer_distill_version == 2:
             cnt = 0
             for layer_num, (t_layer_o, s_layer_o) in enumerate(zip(teacher_layer_output, student_layer_output)):
-                l = mse_loss(t_layer_o, self.model.layer_transformation(s_layer_o))
                 if mlp_z[layer_num] > 0:
-                    layer_loss += l
+                    layer_loss += mse_loss(t_layer_o, self.model.layer_transformation(s_layer_o))
                     cnt += 1
             layer_loss = layer_loss / max(cnt, 1)
 
         # distilling layers with a minimal distance
         elif self.cofi_args.layer_distill_version > 2:
             l = []
+            # specified_teacher_layers = [2, 5, 8, 11]
             specified_teacher_layers = [2, 5, 8, 11]
             transformed_s_layer_o = [self.model.layer_transformation(s_layer_o) for s_layer_o in student_layer_output]
             specified_teacher_layer_reps = [teacher_layer_output[i] for i in specified_teacher_layers] #! teacher: 4x[32,113,768]
@@ -183,13 +194,44 @@ class CoFiTrainer(Trainer):
             else:
                 raise ValueError(f"{self.cofi_args.layer_distill_version} version is not specified.")
 
-            layerwise = torch.arange(4, device=self.args.device)
+            layerwise = torch.arange(len(specified_teacher_layers), device=self.args.device)
             #! layerwise: teacher (specified layers) / alignment: student (min loss layers) / layerwiseloss: [4,12]
             # layer_loss += layerwiseloss[layerwise, alignment].sum()
             layer_loss += layerwiseloss[layerwise, alignment].mean()
 
             # if self.global_step % 100 == 0:
             #     print(f"v{self.cofi_args.layer_distill_version} Global step: {self.global_step}, Alignment: " + str(alignment))
+        elif self.cofi_args.layer_distill_version > 10:
+            layerwiseloss = []
+            specified_layers = [2, 5, 8, 11]
+            if self.cofi_args.layer_distill_version == 11:
+                specified_student_out = [student_layer_output[i] for i in specified_layers]
+                specified_teacher_out = [self.model.layer_transformation(teacher_layer_output[i]) for i in specified_layers] #! teacher: 4x[32,113,768]
+                for s_out, t_out in zip(specified_student_out, specified_teacher_out):
+                    layerwiseloss.append(mse_loss(s_out, t_out))
+                layerwiseloss = torch.stack(layerwiseloss)
+                layer_loss += layerwiseloss.mean()
+
+            if self.cofi_args.layer_distill_version == 12:
+                specified_student_out = [self.student_layer_trans(student_layer_output[i]) for i in specified_layers]
+                specified_teacher_out = [self.teacher_layer_trans(teacher_layer_output[i]) for i in specified_layers]
+                for s_out, t_out in zip(specified_student_out, specified_teacher_out):
+                    layerwiseloss.append(kl_loss(F.log_softmax(s_out, dim=-1), F.softmax(t_out, dim=-1)))
+                layerwiseloss = torch.stack(layerwiseloss)
+                layer_loss += layerwiseloss.mean()
+
+            if self.cofi_args.layer_distill_version == 13:
+                encoder_layer_idxs = []
+                layer_loss = 0.0
+                for i in range(12):
+                    if mlp_z[i] > 0.0  and head_layer_z > 0.0:
+                        encoder_layer_idxs.append(i)
+                for i, idx in enumerate(encoder_layer_idxs):
+                    layer_disitil_loss = []
+                    for j in range(idx, 12):
+                        layer_disitil_loss.append(F.mse_loss(student_layer_output[i], teacher_layer_output[j]))
+                    layer_loss += min(layer_disitil_loss)
+
         return layer_loss
 
     def calculate_distillation_loss(self, teacher_outputs, student_outputs, zs):
@@ -216,19 +258,20 @@ class CoFiTrainer(Trainer):
 
         distil_loss = distil_layer_loss = distil_logit_loss = lagrange = None
         loss = 0.0
-        if self.teacher_model is not None :
+        
+        if self.cofi_args.layer_distill_version == 0:
+            distil_loss = self.compute_loss(model, inputs)
+        else:
             with torch.no_grad():
                 # only retain inputs of certain keys
                 teacher_inputs_keys = ["labels", "pixel_values"]
                 teacher_inputs = {key: inputs[key] for key in teacher_inputs_keys if key in inputs}
-                teacher_outputs = self.teacher_model(**teacher_inputs, output_attentions=True, output_hidden_states=True)
-            student_outputs = model(**inputs, output_attentions=True, output_hidden_states=True)
+                teacher_outputs = self.teacher_model(**teacher_inputs, output_attentions=False, output_hidden_states=True)
+            student_outputs = model(**inputs, output_attentions=False, output_hidden_states=True)
 
             zs = {key: inputs[key] for key in inputs if "_z" in key} #! extract the zs
             distil_loss, distil_layer_loss, distil_logit_loss = self.calculate_distillation_loss(teacher_outputs, student_outputs, zs)
-        else:
-            distil_loss = self.compute_loss(model, inputs)
-
+        
         loss += distil_loss
         if self.start_prune and self.l0_module is not None:
             lagrange, *_ = self.l0_module.lagrangian_regularization(self.global_step - self.prepruning_finetune_steps)
@@ -404,11 +447,31 @@ class CoFiTrainer(Trainer):
         return TrainOutput(self.global_step, final_loss, None)
 
     def evaluate(self, *args, **kwargs) -> Dict[str, float]:
+        pruned_sparsity = 1.0
+        if self.start_prune:
+            self.l0_module.eval()
+            self.zs = self.l0_module.forward(training=False)
+            pruned_sparsity = self.l0_module.calculate_model_size(self.zs)['pruned_model_sparsity']
         metrics = super().evaluate(*args, **kwargs)
-        zs = self.l0_module.forward(False)
-        pruned_sparsity = self.l0_module.calculate_model_size(zs)['pruned_model_sparsity']
+
         return {
             'Accuracy': metrics['eval_accuracy'], 
             'Throughput': metrics['eval_samples_per_second'], 
             'Sparsity': round(pruned_sparsity, 4)
         }
+
+    def predict(self,  *args, **kwargs):
+        pruned_sparsity = 1.0
+        if self.start_prune:
+            self.l0_module.eval()
+            self.zs = self.l0_module.forward(training=False)
+            pruned_sparsity = self.l0_module.calculate_model_size(self.zs)['pruned_model_sparsity']
+        metrics = super().predict(*args, **kwargs)
+        metrics.metrics['sparsity'] = round(pruned_sparsity, 4)
+        return metrics
+
+    def prediction_step(self, model, inputs, *args, **kwargs):
+        if self.zs is not None:
+            inputs.update(self.zs)
+        return super().prediction_step(model, inputs, *args, **kwargs)
+    

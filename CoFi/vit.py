@@ -11,7 +11,6 @@ class CoFiViTForImageClassification(ViTForImageClassification):
     def __init__(self, config):
         super().__init__(config)
         self.vit = CoFiViTModel(config, add_pooling_layer=False)
-        # self.layer_transformation = nn.Linear(config.hidden_size, config.hidden_size) if layer_distill else None
         self.layer_transformation = nn.Linear(config.hidden_size, config.hidden_size)
 
     def forward(
@@ -46,7 +45,7 @@ class CoFiViTForImageClassification(ViTForImageClassification):
             hidden_z=hidden_z,
         )
 
-        sequence_output = outputs[0]
+        sequence_output = outputs.last_hidden_state
         if hidden_z is not None:
             sequence_output = sequence_output.mul(hidden_z)
 
@@ -90,13 +89,8 @@ class CoFiViTForImageClassification(ViTForImageClassification):
 class CoFiViTModel(ViTModel):
     def __init__(self, config, add_pooling_layer: bool = True, use_mask_token: bool = False):
         super().__init__(config, add_pooling_layer, use_mask_token)
-        self.embeddings = CoFiViTEmbeddings(config)
-        self.encoder = CoFiViTEncoder(config)
-        self.layernorm = CoFiLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-
         self.embeddings = CoFiViTEmbeddings(config, use_mask_token=use_mask_token)
         self.encoder = CoFiViTEncoder(config)
-
         self.layernorm = CoFiLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
         # Initialize weights and apply final processing
@@ -147,7 +141,7 @@ class CoFiViTModel(ViTModel):
             head_layer_z=head_layer_z,
             hidden_z=hidden_z,
         )
-        sequence_output = encoder_outputs[0]
+        sequence_output = encoder_outputs.last_hidden_state
         sequence_output = self.layernorm(sequence_output, hidden_z=hidden_z)
         pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
 
@@ -191,7 +185,7 @@ class CoFiViTEmbeddings(ViTEmbeddings):
         pixel_values, 
         bool_masked_pos=None,
         interpolate_pos_encoding=False,
-        hidden_z=None
+        hidden_z=None, *args, **kwargs
     ):
         batch_size, num_channels, height, width = pixel_values.shape
         embeddings = self.patch_embeddings(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
@@ -248,37 +242,16 @@ class CoFiViTEncoder(ViTEncoder):
 
             layer_head_mask = head_mask[i] if head_mask is not None else None
 
-            if getattr(self.config, "gradient_checkpointing", False) and self.training:
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        return module(
-                            *inputs,
-                            output_attentions,
-                            intermediate_z=intermediate_z[i] if intermediate_z is not None else None,
-                            head_z=head_z[i] if head_z is not None else None,
-                            mlp_z=mlp_z[i] if mlp_z is not None else None,
-                            head_layer_z=head_layer_z[i] if head_layer_z is not None else None,
-                            hidden_z=hidden_z,
-                        )
-
-                    return custom_forward
-
-                layer_outputs = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(layer_module),
-                    hidden_states,
-                    layer_head_mask,
-                )
-            else:
-                layer_outputs = layer_module(
-                    hidden_states,
-                    layer_head_mask,
-                    output_attentions,
-                    intermediate_z=intermediate_z[i] if intermediate_z is not None else None,
-                    head_z=head_z[i] if head_z is not None else None,
-                    mlp_z=mlp_z[i] if mlp_z is not None else None,
-                    head_layer_z=head_layer_z[i] if head_layer_z is not None else None,
-                    hidden_z=hidden_z,
-                )
+            layer_outputs = layer_module(
+                hidden_states,
+                layer_head_mask,
+                output_attentions,
+                intermediate_z=intermediate_z[i] if intermediate_z is not None else None,
+                head_z=head_z[i] if head_z is not None else None,
+                mlp_z=mlp_z[i] if mlp_z is not None else None,
+                head_layer_z=head_layer_z[i] if head_layer_z is not None else None,
+                hidden_z=hidden_z,
+            )
 
             hidden_states = layer_outputs[0]
 
@@ -302,8 +275,8 @@ class CoFiViTLayer(ViTLayer):
         super().__init__(config)
         self.config = config
         self.attention = CoFiViTAttention(config)
-        self.output = CoFiViTOutput(config)
         self.intermediate = ViTIntermediate(config)
+        self.output = CoFiViTOutput(config)
         self.layernorm_before = CoFiLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.layernorm_after = CoFiLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
@@ -340,9 +313,9 @@ class CoFiViTLayer(ViTLayer):
             layer_output = layer_output.mul(intermediate_z)
 
         # second residual connection is done here
-        layer_output = self.output(layer_output, hidden_states)
+        layer_output = self.output(layer_output, hidden_states, mlp_z=mlp_z, hidden_z=hidden_z)
 
-        outputs = (layer_output,) + outputs
+        outputs = (layer_output, ) + outputs
 
         return outputs
 
@@ -369,7 +342,10 @@ class CoFiViTAttention(ViTAttention):
             head_z=head_z
         )
 
-        attention_output = self.output(self_outputs[0], hidden_states, head_layer_z=head_layer_z, hidden_z=hidden_z)
+        attention_output = self.output(
+            self_outputs[0], hidden_states, 
+            head_layer_z=head_layer_z, hidden_z=hidden_z
+        )
 
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
         return outputs
@@ -408,6 +384,7 @@ class CoFiViTSelfAttention(ViTSelfAttention):
             attention_probs = attention_probs * head_mask
 
         context_layer = torch.matmul(attention_probs, value_layer)
+
         if head_z is not None:
             context_layer = context_layer.mul(head_z)
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
@@ -423,20 +400,17 @@ class CoFiViTSelfOutput(ViTSelfOutput):
     def __init__(self, config):
         super().__init__(config)
 
-    def forward(self, hidden_states, input_tensor, head_layer_z=None, hidden_z=None, inference=False):
+    def forward(self, hidden_states, input_tensor, head_layer_z=None, hidden_z=None):
         if hidden_states is None:
             return input_tensor
         hidden_states = self.dense(hidden_states)
         if head_layer_z is not None:
             hidden_states = hidden_states.mul(head_layer_z)
-        if not inference and hidden_states.sum().eq(0).item():
-            hidden_states = hidden_states + input_tensor
-        else:
-            if hidden_z is not None:
-                hidden_states = hidden_states.mul(hidden_z)
-            hidden_states = self.dropout(hidden_states)
-            if hidden_z is not None:
-                hidden_states = hidden_states.mul(hidden_z)
+
+        if hidden_z is not None:
+            hidden_states = hidden_states.mul(hidden_z)
+        hidden_states = self.dropout(hidden_states)
+
         return hidden_states
 
 
@@ -445,12 +419,10 @@ class CoFiViTOutput(ViTOutput):
         super().__init__(config)
         self.config = config
 
-    def forward(self, hidden_states, input_tensor, mlp_z=None, hidden_z=None, inference=False):
+    def forward(self, hidden_states, input_tensor, mlp_z=None, hidden_z=None):
         hidden_states = self.dense(hidden_states)
         if mlp_z is not None:
             hidden_states = hidden_states.mul(mlp_z)
-        if not inference and hidden_states.sum().eq(0).item():
-            return hidden_states + input_tensor
         if hidden_z is not None:
             hidden_states = hidden_states.mul(hidden_z)
         hidden_states = self.dropout(hidden_states)
@@ -458,63 +430,3 @@ class CoFiViTOutput(ViTOutput):
         hidden_states = hidden_states + input_tensor
 
         return hidden_states
-
-
-if __name__ == '__main__':
-    from l0module import L0Module
-
-    x = torch.rand(1, 3, 224, 224)
-
-    # model = CoFiViTForImageClassification.from_pretrained('test-cifar-10/checkpoint-1056')
-    model = CoFiViTForImageClassification.from_pretrained('google/vit-base-patch16-224')
-
-    l0module = L0Module(model.config)
-    zs = l0module(True)
-
-    with torch.no_grad():
-        y = model(x, **zs, output_attentions=True, output_hidden_states=True)
-        # y = model(x)
-        print(y)
-
-    # from transformers import ViTModel, ViTConfig
-
-    # x = torch.rand(1, 3, 224, 224)
-
-    # # Initializing a ViT vit-base-patch16-224 style configuration
-    # cfg = {
-    #     'hidden_size': 768, 'num_hidden_layers': 12, 'num_attention_heads': 12, 
-    #     'intermediate_size': 768*4, 'hidden_act': 'gelu', 
-    #     'hidden_dropout_prob': 0.0, 'attention_probs_dropout_prob': 0.0, 'initializer_range': 0.02, 
-    #     'layer_norm_eps': 1e-12, 'image_size': 224, 'patch_size': 16, 
-    #     'num_channels': 3, 'qkv_bias': True, 'encoder_stride': 16
-    # }
-    # cfg.update({
-    #     'hidden_size': 192, 
-    #     'num_hidden_layers': 12,
-    #     'num_attention_heads': 3,
-    #     'intermediate_size': 4*192
-    # })
-    # config = ViTConfig(**cfg)
-
-    # # Initializing a model from the vit-base-patch16-224 style configuration
-    # # model = ViTModel(config)
-    # # model = CoFiViTModel(config)
-    # model = CoFiViTForImageClassification(config)
-    # l0module = L0Module(config)
-    # zs = l0module(True)
-    # # print(zs)
-    # # Accessing the model configuration
-    # print(model.config)
-    # print(sum(p.numel() for p in model.parameters()))
-
-    # with torch.no_grad():
-    #     y = model(x, **zs)
-
-    # model = CoFiViTForImageClassification.from_pretrained('google/vit-base-patch16-224')
-    # print(vars(model.config).keys())
-    # l0module = L0Module(model.config)
-    # zs = l0module(True)
-
-    # with torch.no_grad():
-    #     y = model(x, **zs)
-    #     y = model(x)

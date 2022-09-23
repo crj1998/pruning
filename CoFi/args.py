@@ -12,7 +12,7 @@ class CoFiArguments():
 
     ex_name: str = field(default="test", metadata={"help": "Name of experiment. Base directory of output dir."})
     pruning_type: str = field(default=None, metadata={"help": "Type of pruning"})
-    reg_learning_rate: float = field(default=0.1, metadata={"help": "Learning rate for regularization."})
+    reg_learning_rate: float = field(default=0.01, metadata={"help": "Learning rate for regularization."})
     scheduler_type: str = field(default="linear", metadata={"help": "type of scheduler"})
     freeze_embeddings: bool = field(default=False, metadata={"help": "Whether we should freeze the embeddings."})
 

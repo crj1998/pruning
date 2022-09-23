@@ -12,7 +12,7 @@ from datasets import load_dataset, load_metric, Features, ClassLabel, Array3D, I
 
 from args import MoveArguments
 from trainer import MoveTrainer
-from vit import MoveViTForImageClassification
+from vit0 import MoveViTForImageClassification
 
 
 def set_seed(seed):

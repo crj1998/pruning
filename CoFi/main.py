@@ -45,9 +45,18 @@ preprocessed_test_ds = test_ds.map(preprocess_images, batched=True, features=fea
 from vit import CoFiViTForImageClassification
 from l0module import L0Module
 
-exp_name = "base+distil+layerv3"
+# exp_name = "base+distilv12(2-5-8-11,0.5)"
+sparsity = 0.70
+distill_version = 0
+alpha = 0.1
+# exp_name = f"base+distilv{distill_version}({alpha})"
+exp_name = f"base({sparsity})"
+# exp_name = f"base+distil"
+# exp_name = f"base(20-40)"
+
+
 args = TrainingArguments(
-    output_dir=f'exp/{exp_name}',
+    output_dir=f'exp0921/{exp_name}',
     disable_tqdm=False,
     evaluation_strategy="epoch",
     eval_steps=256,
@@ -57,7 +66,7 @@ args = TrainingArguments(
     per_device_train_batch_size=96,
     per_device_eval_batch_size=128,
     dataloader_num_workers=4,
-    num_train_epochs=10,
+    num_train_epochs=20,
     weight_decay=0.01,
     load_best_model_at_end=True,
     metric_for_best_model="accuracy",
@@ -71,16 +80,14 @@ args = TrainingArguments(
 cofi_args = CoFiArguments(
     ex_name ="CoFi-ViT-CIFAR10",
     pruning_type="structured_heads+structured_mlp+hidden+layer",
-    target_sparsity=0.9,
+    target_sparsity=sparsity,
     start_sparsity=0.0,
-    # do_layer_distill=True,
-    do_layer_distill = True,
-    layer_distill_version=3,
-    distill_loss_alpha=0.9, 
-    distill_ce_loss_alpha=0.1,
-    distill_temp=1.0,
+    layer_distill_version=distill_version,
+    distill_loss_alpha=1.0-alpha, 
+    distill_ce_loss_alpha=alpha,
+    distill_temp=2.0,
     # dev
-    lagrangian_warmup_epochs=2
+    lagrangian_warmup_epochs=8
 )
 
 def compute_metrics(eval_pred):
@@ -90,7 +97,6 @@ def compute_metrics(eval_pred):
 
 model = CoFiViTForImageClassification.from_pretrained('exp/finetuned-cifar10/checkpoint-4690')
 teacher_model = copy.deepcopy(model)
-# teacher_model = None
 
 config = model.config
 l0module = L0Module(
@@ -116,12 +122,11 @@ outputs = trainer.predict(preprocessed_test_ds)
 print(outputs.metrics)
 
 import os
-output_dir = f'exp/{exp_name}'
-zs = l0module.forward(training=False)
+output_dir = f'exp0921/{exp_name}'
 
 torch.save(l0module.state_dict(), os.path.join(output_dir, "l0_module.pt"))
-torch.save(zs, os.path.join(output_dir, "zs.pt"))
-
+torch.save(model.state_dict(), os.path.join(output_dir, "model.pt"))
 """
 CUDA_VISIBLE_DEVICES=4 python main.py
+
 """

@@ -45,25 +45,31 @@ preprocessed_test_ds = test_ds.map(preprocess_images, batched=True, features=fea
 from vit import CoFiViTForImageClassification
 
 # model = CoFiViTForImageClassification.from_pretrained('google/vit-base-patch16-224', num_labels=10, ignore_mismatched_sizes=True)
-model = CoFiViTForImageClassification.from_pretrained('google/vit-base-patch16-224', num_labels=10, ignore_mismatched_sizes=True)
+model = ViTForImageClassification.from_pretrained('google/vit-base-patch16-224', num_labels=10, ignore_mismatched_sizes=True)
 
+layer_list = list(model.vit.encoder.layer.children())
+# random.shuffle(layer_list)
+num_layers = 3
+layer_list = layer_list[:num_layers]
+model.vit.encoder.layer = nn.ModuleList(layer_list)
 args = TrainingArguments(
-    f"exp/finetuned-cifar10",
+    f"exptmp/finetuned-cifar10-{num_layers}",
     evaluation_strategy="epoch",
     save_strategy="epoch",
     learning_rate=2e-5,
     per_device_train_batch_size=96,
     per_device_eval_batch_size=512,
     dataloader_num_workers=4,
-    num_train_epochs=10,
+    num_train_epochs=5,
     weight_decay=0.01,
     load_best_model_at_end=True,
     metric_for_best_model="accuracy",
     logging_dir='logs/finetuned',
-    logging_steps=16,
+    logging_steps=64,
     logging_first_step=True,
     logging_strategy='steps',
-    report_to="wandb"
+    # report_to="wandb"
+    report_to = None
 )
 
 
@@ -86,5 +92,5 @@ trainer.train()
 outputs = trainer.predict(preprocessed_test_ds)
 print(outputs.metrics)
 """
-CUDA_VISIBLE_DEVICES=3 python finetune.py
+CUDA_VISIBLE_DEVICES=7 python finetune.py
 """
